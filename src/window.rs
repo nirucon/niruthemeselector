@@ -180,7 +180,7 @@ impl State {
         self.message_is_error = error;
     }
 
-    pub fn refresh(&mut self) -> Result<(), String> {
+    pub fn refresh(&mut self) -> Result<bool, String> {
         let catalog = backend::catalog()?;
         let changed = snapshot(&catalog) != self.seen;
         let old_selected = self.selected.clone();
@@ -210,7 +210,7 @@ impl State {
         if changed {
             self.request_visible();
         }
-        Ok(())
+        Ok(changed)
     }
 
     fn request_visible(&mut self) {
@@ -263,7 +263,7 @@ impl State {
             .map(|card| card.entry.id.clone())
             .ok_or("select a theme first")?;
         backend::apply(&id)?;
-        self.refresh()?;
+        let _ = self.refresh()?;
         self.set_message(format!("Applied {id}."), false);
         Ok(())
     }
@@ -273,7 +273,7 @@ impl State {
         let id = card.entry.id.clone();
         let hide = !card.entry.hidden;
         backend::hide(&id, hide)?;
-        self.refresh()?;
+        let _ = self.refresh()?;
         self.set_message(
             if hide {
                 format!("Hid {id}. It remains installed and can be shown again.")
@@ -300,7 +300,7 @@ impl State {
             return Err("bundled themes are hidden, not removed".into());
         }
         backend::remove(&id)?;
-        self.refresh()?;
+        let _ = self.refresh()?;
         self.set_message(format!("Removed {id}."), false);
         Ok(())
     }
@@ -320,7 +320,7 @@ impl State {
             return Err("enter the theme TOML path first".into());
         }
         backend::import(theme, wallpaper, id, *replace)?;
-        self.refresh()?;
+        let _ = self.refresh()?;
         let imported = if id.trim().is_empty() {
             std::path::Path::new(theme)
                 .file_stem()
@@ -1790,13 +1790,10 @@ pub fn run(app: &mut App, mut state: State) -> Result<(), String> {
                             });
                             state.focus = None;
                         }
-                        K_R => {
-                            if let Err(error) = state.refresh() {
-                                state.set_message(error, true);
-                            } else {
-                                state.set_message("Reloaded the theme catalogue.", false);
-                            }
-                        }
+                        K_R => match state.refresh() {
+                            Ok(_) => state.set_message("Reloaded the theme catalogue.", false),
+                            Err(error) => state.set_message(error, true),
+                        },
                         K_H => {
                             if let Err(error) = state.hide_toggle() {
                                 state.set_message(error, true);
@@ -1819,8 +1816,9 @@ pub fn run(app: &mut App, mut state: State) -> Result<(), String> {
                         }
                         K_V => {
                             state.show_hidden = !state.show_hidden;
-                            if let Err(error) = state.refresh() {
-                                state.set_message(error, true);
+                            match state.refresh() {
+                                Ok(_) => {}
+                                Err(error) => state.set_message(error, true),
                             }
                         }
                         _ => {}
@@ -1878,21 +1876,17 @@ pub fn run(app: &mut App, mut state: State) -> Result<(), String> {
         if state.collect_thumbs() {
             dirty = true;
         }
-        let interval = Duration::from_secs(2);
+        let interval = Duration::from_secs(5);
         if last_refresh.elapsed() >= interval
             && last_activity.elapsed() >= Duration::from_millis(200)
         {
             last_refresh = Instant::now();
-            if let Err(error) = state.refresh() {
-                state.set_message(error, true);
-            } else if state.message.is_empty() {
-                state.set_message(
-                    "Select a theme to preview it. Apply changes the desktop.",
-                    false,
-                );
+            match state.refresh() {
+                Ok(true) => dirty = true,
+                Ok(false) => {}
+                Err(error) => state.set_message(error, true),
             }
             state.request_visible();
-            dirty = true;
         }
         if dirty {
             app.palette = state.palette;
@@ -2026,17 +2020,15 @@ fn activate(app: &mut App, state: &mut State, hit: Hit) -> Result<(), String> {
         }
         Hit::ToggleHidden => {
             state.show_hidden = !state.show_hidden;
-            if let Err(error) = state.refresh() {
-                state.set_message(error, true);
+            match state.refresh() {
+                Ok(_) => {}
+                Err(error) => state.set_message(error, true),
             }
         }
-        Hit::Reload => {
-            if let Err(error) = state.refresh() {
-                state.set_message(error, true);
-            } else {
-                state.set_message("Reloaded the theme catalogue.", false);
-            }
-        }
+        Hit::Reload => match state.refresh() {
+            Ok(_) => state.set_message("Reloaded the theme catalogue.", false),
+            Err(error) => state.set_message(error, true),
+        },
         Hit::ImportField(field) => {
             if let Some(Modal::Import { field: current, .. }) = state.modal.as_mut() {
                 *current = field;
