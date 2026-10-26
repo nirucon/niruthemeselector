@@ -45,7 +45,7 @@ fn cache_dir() -> PathBuf {
 /// away a perfectly good preview. As a last resort the first and last 64 KiB
 /// are hashed, so two quick same-size replacements of a large file still get
 /// distinct keys.
-fn key(path: &Path) -> String {
+pub(crate) fn key(path: &Path) -> String {
     let meta = fs::metadata(path).ok();
     let mut hasher = DefaultHasher::new();
     path.hash(&mut hasher);
@@ -114,7 +114,7 @@ pub fn decode_preview(path: &Path) -> Option<image::RgbaImage> {
     let mut reader = reader;
     reader.limits(limits);
     let format = reader.format()?;
-    let mut decoder = reader.into_decoder().ok()?;
+    let decoder = reader.into_decoder().ok()?;
     // Ask the decoder for the target size: most formats read the header
     // first, so this is the point where a large picture costs a small decode.
     use image::ImageDecoder as _;
@@ -131,7 +131,6 @@ pub fn decode_preview(path: &Path) -> Option<image::RgbaImage> {
     } else {
         (iw, ih)
     };
-    decoder.set_limits(image::Limits::no_limits()).ok()?;
     let image = image::DynamicImage::from_decoder(decoder).ok()?;
     let small = if scale < 1.0 {
         image.resize_exact(tw, th, image::imageops::FilterType::Triangle)
@@ -160,6 +159,18 @@ fn write_cache(path: &Path, image: &image::RgbaImage) {
     };
     if fs::create_dir_all(dir).is_err() {
         return;
+    }
+    // Limit retained generations; replacing a large image must not grow cache forever.
+    let mut cached: Vec<_> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("png"))
+        .collect();
+    cached.sort_by_key(|entry| entry.metadata().and_then(|m| m.modified()).ok());
+    let excess = cached.len().saturating_sub(127);
+    for entry in cached.into_iter().take(excess) {
+        let _ = fs::remove_file(entry.path());
     }
     // Write beside the target and rename, so a second instance never reads a
     // half-written preview.

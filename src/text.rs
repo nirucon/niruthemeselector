@@ -10,20 +10,24 @@ use crate::theme::Palette;
 pub struct Font {
     face: FontArc,
     size: f32,
+    scale: f32,
 }
 
 impl Font {
     pub fn load(_palette: Palette) -> Self {
+        let scale = shared_font().1 / 15.0;
         Self {
             face: load_face(),
-            size: 13.0,
+            size: 13.0 * scale,
+            scale,
         }
     }
 
     pub fn size(&self, size: f32) -> Self {
         Self {
             face: self.face.clone(),
-            size,
+            size: size * self.scale,
+            scale: self.scale,
         }
     }
 
@@ -89,8 +93,48 @@ fn split(pixel: u32) -> (u8, u8, u8) {
     )
 }
 
+fn shared_font() -> (Option<String>, f32) {
+    let root = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")
+        })
+        .join("niruwm");
+    let mut path = None;
+    let mut size = 15.0f32;
+    for name in ["config.toml", "appearance.toml"] {
+        if let Some(doc) = std::fs::read_to_string(root.join(name))
+            .ok()
+            .and_then(|text| text.parse::<toml::Value>().ok())
+        {
+            if let Some(value) = doc.get("font_path").and_then(|v| v.as_str()) {
+                path = Some(value.to_owned());
+            }
+            if let Some(value) = doc
+                .get("font_size")
+                .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|n| n as f64)))
+            {
+                if value.is_finite() && (8.0..=36.0).contains(&value) {
+                    size = value as f32;
+                }
+            }
+        }
+    }
+    (path, size)
+}
+
 fn load_face() -> FontArc {
     let mut candidates: Vec<String> = Vec::new();
+    if let Some(path) = shared_font().0 {
+        candidates.push(if let Some(rest) = path.strip_prefix("~/") {
+            std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+                .join(rest)
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            path
+        });
+    }
     if let Ok(out) = std::process::Command::new("fc-match")
         .args([
             "-f",

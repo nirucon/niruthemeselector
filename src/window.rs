@@ -13,7 +13,7 @@ use crate::{
 use image::RgbaImage;
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, Sender},
     time::{Duration, Instant},
 };
@@ -116,15 +116,17 @@ pub struct State {
     pub palette: Palette,
     pub thumbs: HashMap<PathBuf, Option<RgbaImage>>,
     requested: HashSet<PathBuf>,
-    tx: Sender<PathBuf>,
-    rx: Receiver<(PathBuf, Option<RgbaImage>)>,
+    tx: mpsc::SyncSender<(PathBuf, String)>,
+    rx: Receiver<(PathBuf, String, Option<RgbaImage>)>,
+    stamps: HashMap<PathBuf, String>,
+    viewport: (usize, usize),
     seen: String,
 }
 
 impl State {
     pub fn load() -> Result<Self, String> {
-        let (request_tx, request_rx) = mpsc::channel::<PathBuf>();
-        let (result_tx, result_rx) = mpsc::channel::<(PathBuf, Option<RgbaImage>)>();
+        let (request_tx, request_rx) = mpsc::sync_channel::<(PathBuf, String)>(32);
+        let (result_tx, result_rx) = mpsc::channel::<(PathBuf, String, Option<RgbaImage>)>();
         spawn_workers(request_rx, result_tx);
         let catalog = backend::catalog()?;
         let cards = build_cards(&catalog);
@@ -147,6 +149,8 @@ impl State {
             palette: theme::load(),
             thumbs: HashMap::new(),
             requested: HashSet::new(),
+            stamps: HashMap::new(),
+            viewport: (3, 3),
             tx: request_tx,
             rx: result_rx,
             seen,
@@ -182,7 +186,7 @@ impl State {
 
     pub fn refresh(&mut self) -> Result<bool, String> {
         let catalog = backend::catalog()?;
-        let changed = snapshot(&catalog) != self.seen;
+        let changed = snapshot(&catalog) != self.seen || theme::load() != self.palette;
         let old_selected = self.selected.clone();
         self.catalog = catalog;
         self.cards = build_cards(&self.catalog);
@@ -214,14 +218,35 @@ impl State {
     }
 
     fn request_visible(&mut self) {
-        for index in self.visible_indices() {
+        let (cols, rows) = self.viewport;
+        let visible = self.visible_indices();
+        let mut indices: Vec<_> = visible
+            .into_iter()
+            .skip(self.scroll * cols)
+            .take((cols * rows).min(32))
+            .collect();
+        if let Some(selected) = self
+            .selected
+            .as_deref()
+            .and_then(|id| self.cards.iter().position(|card| card.entry.id == id))
+        {
+            if !indices.contains(&selected) {
+                indices.insert(0, selected);
+            }
+        }
+        for index in indices {
             let Some(path) = self.cards[index].wallpaper.clone() else {
                 continue;
             };
+            let stamp = thumbs::key(&path);
+            if self.stamps.get(&path) != Some(&stamp) {
+                self.thumbs.remove(&path);
+            }
             if self.thumbs.contains_key(&path) || self.requested.contains(&path) {
                 continue;
             }
-            if self.tx.send(path.clone()).is_ok() {
+            if self.tx.try_send((path.clone(), stamp.clone())).is_ok() {
+                self.stamps.insert(path.clone(), stamp);
                 self.requested.insert(path);
             }
         }
@@ -229,7 +254,17 @@ impl State {
 
     fn collect_thumbs(&mut self) -> bool {
         let mut changed = false;
-        while let Ok((path, image)) = self.rx.try_recv() {
+        while let Ok((path, stamp, image)) = self.rx.try_recv() {
+            self.requested.remove(&path);
+            if self.stamps.get(&path) != Some(&stamp) || thumbs::key(&path) != stamp {
+                continue;
+            }
+            if self.thumbs.len() >= 64 {
+                if let Some(old) = self.thumbs.keys().next().cloned() {
+                    self.thumbs.remove(&old);
+                    self.stamps.remove(&old);
+                }
+            }
             self.thumbs.insert(path, image);
             changed = true;
         }
@@ -237,6 +272,7 @@ impl State {
     }
 
     fn ensure_visible(&mut self, cols: usize, rows: usize) {
+        self.viewport = (cols.max(1), rows.max(1));
         let Some(id) = self.selected.as_deref() else {
             return;
         };
@@ -350,6 +386,10 @@ fn snapshot(catalog: &Catalog) -> String {
         catalog.active, catalog.appearance_overrides, catalog.follow_theme, catalog.theme_dir
     );
     for theme in &catalog.themes {
+        out.push_str(&serde_json::to_string(&theme.colors).unwrap_or_default());
+        if let Some(path) = theme.wallpaper.as_deref() {
+            out.push_str(&thumbs::key(Path::new(path)));
+        }
         out.push_str(&format!(
             "{}:{}:{}:{}:{}:{}:{}:{};",
             theme.id,
@@ -2127,14 +2167,17 @@ fn wait_for_input(app: &App) -> Result<(), String> {
     Ok(())
 }
 
-fn spawn_workers(work: Receiver<PathBuf>, done: Sender<(PathBuf, Option<RgbaImage>)>) {
+fn spawn_workers(
+    work: Receiver<(PathBuf, String)>,
+    done: Sender<(PathBuf, String, Option<RgbaImage>)>,
+) {
     use std::sync::{Arc, Mutex};
     let work = Arc::new(Mutex::new(work));
     for _ in 0..2 {
         let work = work.clone();
         let done = done.clone();
         std::thread::spawn(move || loop {
-            let path = {
+            let (path, stamp) = {
                 let Ok(receiver) = work.lock() else {
                     return;
                 };
@@ -2144,7 +2187,7 @@ fn spawn_workers(work: Receiver<PathBuf>, done: Sender<(PathBuf, Option<RgbaImag
                 }
             };
             let image = thumbs::decode_preview(&path);
-            if done.send((path, image)).is_err() {
+            if done.send((path, stamp, image)).is_err() {
                 return;
             }
         });
