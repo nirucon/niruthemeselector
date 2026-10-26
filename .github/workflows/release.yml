@@ -1,0 +1,43 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: x86_64-unknown-linux-musl }
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - run: |
+          test "$(target/x86_64-unknown-linux-musl/release/niruthemeselector --version | awk '{print $2}')" = "${GITHUB_REF_NAME#v}"
+          file target/x86_64-unknown-linux-musl/release/niruthemeselector
+          sh tests/cli-smoke.sh target/x86_64-unknown-linux-musl/release/niruthemeselector
+      - run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/niruthemeselector dist/
+          cp niruthemeselector.desktop dist/
+          cp assets/niruthemeselector.png dist/niruthemeselector.png
+          cd dist && sha256sum niruthemeselector niruthemeselector.desktop niruthemeselector.png > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with: { name: dist, path: dist }
+  publish-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: dist, path: dist }
+      - uses: softprops/action-gh-release@v2
+        with:
+          make_latest: true
+          files: |
+            dist/niruthemeselector
+            dist/niruthemeselector.desktop
+            dist/niruthemeselector.png
+            dist/SHA256SUMS
+          generate_release_notes: true

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=NIRU Theme Selector
+Comment=Preview, apply and manage NIRUX themes
+Keywords=Theme;Appearance;Colours;Wallpaper;Preview;Profile;
+Exec=niruthemeselector
+Icon=niruthemeselector
+Terminal=false
+Categories=Settings;DesktopSettings;Qt;
+StartupNotify=false
