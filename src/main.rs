@@ -1,9 +1,14 @@
 //! NIRU Theme Selector — native graphical theme browser and manager.
 
 mod backend;
+mod import;
+mod keyboard;
+mod layout;
+mod state;
 mod text;
 mod theme;
 mod thumbs;
+mod watch;
 mod window;
 
 use std::process::ExitCode;
@@ -81,7 +86,7 @@ fn print_list() -> ExitCode {
 }
 
 fn run_window() -> ExitCode {
-    let state = match window::State::load() {
+    let state = match state::State::load() {
         Ok(state) => state,
         Err(error) => {
             eprintln!("niruthemeselector: {error}");

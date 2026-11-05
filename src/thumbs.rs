@@ -8,21 +8,39 @@
 //! preview even when the new file has exactly the same size.
 
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
     env, fs,
     hash::{Hash, Hasher},
-    io::Cursor,
+    io::BufReader,
     path::{Path, PathBuf},
+    sync::{
+        mpsc::{self, Receiver, SyncSender},
+        Arc, Mutex,
+    },
     time::SystemTime,
 };
+
+use crate::watch::Wake;
 
 /// Longest side of a preview, in pixels.
 pub const THUMB_SIZE: u32 = 320;
 
 /// Refuse to decode anything larger than this many pixels. An 8K picture is
-/// about 34 megapixels, so this leaves room for 16K while keeping a corrupt
-/// or hostile header from asking for gigabytes.
-pub const MAX_PIXELS: u64 = 200_000_000;
+/// about 33 megapixels; 80 MP is also the most `niructl theme-import`
+/// accepts, so every theme wallpaper NIRUX can have still gets a preview.
+pub const MAX_PIXELS: u64 = 80_000_000;
+
+/// Pictures above this size are decoded one at a time, whatever the number
+/// of workers. Measured on othala (`peak_rss_decoding_8k_pictures`, four 8K
+/// PNG/JPEG on a cold cache, two workers): 0.1.2 peaked 239 MB above the
+/// process baseline, 0.2.0 peaks 97 MB.
+pub const BIG_PIXELS: u64 = 16_000_000;
+
+/// The decoder's own allocation limit: one RGBA frame of `MAX_PIXELS`.
+pub const MAX_ALLOC: u64 = MAX_PIXELS * 4;
+
+/// Held while a big picture decodes.
+static BIG: Mutex<()> = Mutex::new(());
 
 fn cache_dir() -> PathBuf {
     env::var_os("XDG_CACHE_HOME")
@@ -88,13 +106,42 @@ fn edge_bytes(path: &Path) -> Vec<Vec<u8>> {
     out
 }
 
+/// A decoded preview and the picture's own size.
+pub struct Preview {
+    pub image: Option<image::RgbaImage>,
+    pub dims: Option<(u32, u32)>,
+}
+
+/// The picture's size from its header, without decoding it.
+pub fn dimensions(path: &Path) -> Option<(u32, u32)> {
+    image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
 /// Decode a preview of one image.
 ///
-/// Returns `None` for a missing, undecodable or unreasonably large file: the
-/// list then shows a placeholder instead of failing. The file is read in one
-/// operation and decoded from memory, which avoids passing a file descriptor
-/// around a decoder that keeps it open.
-pub fn decode_preview(path: &Path) -> Option<image::RgbaImage> {
+/// Returns no image for a missing, undecodable or unreasonably large file:
+/// the list then shows a placeholder instead of failing. Memory is bounded
+/// three ways: the decoder streams from the file instead of a copy of it in
+/// memory, pictures above `BIG_PIXELS` decode one at a time, and the decoder
+/// may not allocate more than `MAX_ALLOC`. The downscale uses `thumbnail`,
+/// which averages straight into the small picture without a full-width
+/// floating-point intermediate.
+pub fn decode_preview(path: &Path) -> Preview {
+    decode_preview_gated(path, true)
+}
+
+fn decode_preview_gated(path: &Path, gate: bool) -> Preview {
+    let dims = dimensions(path);
+    let image = decode_image(path, dims, gate);
+    Preview { image, dims }
+}
+
+fn decode_image(path: &Path, dims: Option<(u32, u32)>, gate: bool) -> Option<image::RgbaImage> {
     let meta = fs::metadata(path).ok()?;
     if !meta.is_file() || meta.len() == 0 || meta.len() > 512 * 1024 * 1024 {
         return None;
@@ -103,44 +150,191 @@ pub fn decode_preview(path: &Path) -> Option<image::RgbaImage> {
     if let Some(image) = read_cache(&cached) {
         return Some(image);
     }
-    let bytes = fs::read(path).ok()?;
-    let reader = image::ImageReader::new(Cursor::new(&bytes))
+    let (iw, ih) = dims?;
+    let pixels = u64::from(iw) * u64::from(ih);
+    if pixels > MAX_PIXELS {
+        return None;
+    }
+    let _big = (gate && pixels > BIG_PIXELS)
+        .then(|| BIG.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    let file = fs::File::open(path).ok()?;
+    let mut reader = image::ImageReader::new(BufReader::new(file))
         .with_guessed_format()
         .ok()?;
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(65_536);
     limits.max_image_height = Some(65_536);
-    limits.max_alloc = Some(MAX_PIXELS * 5);
-    let mut reader = reader;
+    limits.max_alloc = Some(MAX_ALLOC);
     reader.limits(limits);
-    let format = reader.format()?;
-    let decoder = reader.into_decoder().ok()?;
-    // Ask the decoder for the target size: most formats read the header
-    // first, so this is the point where a large picture costs a small decode.
-    use image::ImageDecoder as _;
-    let (iw, ih) = decoder.dimensions();
-    if u64::from(iw) * u64::from(ih) > MAX_PIXELS {
-        return None;
-    }
+    let image = reader.decode().ok()?;
     let scale = f64::from(THUMB_SIZE) / f64::from(iw.max(ih)).max(1.0);
-    let (tw, th) = if scale < 1.0 {
-        (
-            (f64::from(iw) * scale).round().max(1.0) as u32,
-            (f64::from(ih) * scale).round().max(1.0) as u32,
-        )
-    } else {
-        (iw, ih)
-    };
-    let image = image::DynamicImage::from_decoder(decoder).ok()?;
     let small = if scale < 1.0 {
-        image.resize_exact(tw, th, image::imageops::FilterType::Triangle)
+        let tw = (f64::from(iw) * scale).round().max(1.0) as u32;
+        let th = (f64::from(ih) * scale).round().max(1.0) as u32;
+        let small = image.thumbnail_exact(tw, th);
+        drop(image);
+        small
     } else {
         image
     };
     let rgba = small.to_rgba8();
-    let _ = format;
     write_cache(&cached, &rgba);
     Some(rgba)
+}
+
+/// A finished preview, with the stamp it was asked for.
+pub struct Done {
+    pub path: PathBuf,
+    pub stamp: String,
+    pub preview: Preview,
+}
+
+/// Two decode workers. They wake the event loop through `wake` when a
+/// preview is ready, so the loop never polls for them.
+pub struct Pool {
+    tx: SyncSender<(PathBuf, String)>,
+    rx: Receiver<Done>,
+}
+
+impl Pool {
+    pub fn new(wake: Arc<Wake>) -> Self {
+        let (tx, work) = mpsc::sync_channel::<(PathBuf, String)>(32);
+        let (done, rx) = mpsc::channel::<Done>();
+        let work = Arc::new(Mutex::new(work));
+        for _ in 0..2 {
+            let work = work.clone();
+            let done = done.clone();
+            let wake = wake.clone();
+            std::thread::spawn(move || loop {
+                let (path, stamp) = {
+                    let Ok(receiver) = work.lock() else {
+                        return;
+                    };
+                    match receiver.recv() {
+                        Ok(job) => job,
+                        Err(_) => return,
+                    }
+                };
+                let preview = decode_preview(&path);
+                if done
+                    .send(Done {
+                        path,
+                        stamp,
+                        preview,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                wake.notify();
+            });
+        }
+        Self { tx, rx }
+    }
+
+    /// Queue a decode; false when the queue is full (ask again later).
+    pub fn request(&self, path: PathBuf, stamp: String) -> bool {
+        self.tx.try_send((path, stamp)).is_ok()
+    }
+
+    pub fn try_recv(&self) -> Option<Done> {
+        self.rx.try_recv().ok()
+    }
+}
+
+/// One cached preview.
+pub struct Slot {
+    pub stamp: String,
+    pub image: Option<image::RgbaImage>,
+    pub dims: Option<(u32, u32)>,
+    last_paint: u64,
+}
+
+/// The decoded previews in memory, evicted least recently painted first.
+/// A preview that is on screen or selected is never evicted, so it cannot
+/// reload and flicker.
+pub struct Cache {
+    slots: HashMap<PathBuf, Slot>,
+    requested: HashSet<PathBuf>,
+    tick: u64,
+    cap: usize,
+}
+
+impl Cache {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            slots: HashMap::new(),
+            requested: HashSet::new(),
+            tick: 0,
+            cap: cap.max(1),
+        }
+    }
+
+    pub fn get(&self, path: &Path) -> Option<&Slot> {
+        self.slots.get(path)
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Mark these previews as painted now.
+    pub fn touch<'a>(&mut self, paths: impl IntoIterator<Item = &'a PathBuf>) {
+        self.tick += 1;
+        for path in paths {
+            if let Some(slot) = self.slots.get_mut(path) {
+                slot.last_paint = self.tick;
+            }
+        }
+    }
+
+    /// True when `path` has no preview for `stamp` and none is on its way.
+    pub fn wants(&self, path: &Path, stamp: &str) -> bool {
+        !self.requested.contains(path)
+            && self.slots.get(path).is_none_or(|slot| slot.stamp != stamp)
+    }
+
+    pub fn requested(&mut self, path: PathBuf) {
+        self.requested.insert(path);
+    }
+
+    /// A decode finished (taken or dropped): it is no longer on its way.
+    pub fn arrived(&mut self, path: &Path) {
+        self.requested.remove(path);
+    }
+
+    /// Keep a decoded preview. At the cap, the least recently painted entry
+    /// that is not in `protected` makes room; when every entry is protected
+    /// the cache grows past the cap rather than drop a visible preview.
+    pub fn insert(
+        &mut self,
+        path: PathBuf,
+        stamp: String,
+        preview: Preview,
+        protected: &HashSet<PathBuf>,
+    ) {
+        if !self.slots.contains_key(&path) && self.slots.len() >= self.cap {
+            let victim = self
+                .slots
+                .iter()
+                .filter(|(p, _)| !protected.contains(*p))
+                .min_by_key(|(_, slot)| slot.last_paint)
+                .map(|(p, _)| p.clone());
+            if let Some(victim) = victim {
+                self.slots.remove(&victim);
+            }
+        }
+        self.slots.insert(
+            path,
+            Slot {
+                stamp,
+                image: preview.image,
+                dims: preview.dims,
+                last_paint: self.tick,
+            },
+        );
+    }
 }
 
 fn read_cache(path: &Path) -> Option<image::RgbaImage> {
@@ -232,7 +426,7 @@ mod tests {
         let dir = sandbox("large");
         let src = dir.0.join("big.png");
         write_png(&src, 1920, 1080, 40);
-        let thumb = decode_preview(&src).expect("thumbnail");
+        let thumb = decode_preview(&src).image.expect("thumbnail");
         assert!(
             thumb.width() <= THUMB_SIZE && thumb.height() <= THUMB_SIZE,
             "{thumb:?}"
@@ -248,7 +442,7 @@ mod tests {
         let dir = sandbox("cached");
         let src = dir.0.join("wall.png");
         write_png(&src, 640, 360, 10);
-        decode_preview(&src).unwrap();
+        decode_preview(&src).image.unwrap();
         let entries = fs::read_dir(cache_dir()).unwrap().count();
         assert_eq!(entries, 1, "one preview written");
         let stamp = fs::read_dir(cache_dir())
@@ -257,7 +451,7 @@ mod tests {
             .map(|e| e.metadata().unwrap().modified().unwrap())
             .next()
             .unwrap();
-        decode_preview(&src).unwrap();
+        decode_preview(&src).image.unwrap();
         assert_eq!(
             fs::read_dir(cache_dir())
                 .unwrap()
@@ -271,7 +465,7 @@ mod tests {
 
         // A same-size replacement must produce a new preview and a new shade.
         write_png(&src, 640, 360, 200);
-        let third = decode_preview(&src).unwrap();
+        let third = decode_preview(&src).image.unwrap();
         assert_eq!(
             third.get_pixel(0, 0).0[0],
             200,
@@ -290,7 +484,7 @@ mod tests {
         let dir = sandbox("corrupt");
         let src = dir.0.join("wall.png");
         write_png(&src, 320, 200, 90);
-        decode_preview(&src).unwrap();
+        decode_preview(&src).image.unwrap();
         let cached = fs::read_dir(cache_dir())
             .unwrap()
             .flatten()
@@ -298,7 +492,9 @@ mod tests {
             .next()
             .unwrap();
         fs::write(&cached, b"not a png").unwrap();
-        let image = decode_preview(&src).expect("a corrupt cache must not hide the image");
+        let image = decode_preview(&src)
+            .image
+            .expect("a corrupt cache must not hide the image");
         assert_eq!(image.get_pixel(0, 0).0[0], 90);
     }
 
@@ -306,11 +502,11 @@ mod tests {
     fn a_missing_or_broken_file_has_no_preview() {
         let _guard = lock();
         let dir = sandbox("broken");
-        assert!(decode_preview(&dir.0.join("absent.png")).is_none());
+        assert!(decode_preview(&dir.0.join("absent.png")).image.is_none());
         let junk = dir.0.join("junk.png");
         fs::write(&junk, b"not an image").unwrap();
         assert!(
-            decode_preview(&junk).is_none(),
+            decode_preview(&junk).image.is_none(),
             "a broken file must not panic"
         );
     }
@@ -328,11 +524,110 @@ mod tests {
             ("d.png", image::ImageFormat::Png),
         ] {
             let path = dir.0.join(name);
-            let mut cursor = Cursor::new(Vec::new());
+            let mut cursor = std::io::Cursor::new(Vec::new());
             dynamic.write_to(&mut cursor, format).unwrap();
             fs::write(&path, cursor.into_inner()).unwrap();
-            let thumb = decode_preview(&path).unwrap_or_else(|| panic!("{name} has no preview"));
+            let preview = decode_preview(&path);
+            let thumb = preview
+                .image
+                .unwrap_or_else(|| panic!("{name} has no preview"));
             assert_eq!(thumb.width(), 96, "{name}");
+            assert_eq!(preview.dims, Some((96, 64)), "{name}");
         }
+    }
+
+    fn preview(shade: u8) -> Preview {
+        Preview {
+            image: Some(image::RgbaImage::from_pixel(2, 2, image::Rgba([shade; 4]))),
+            dims: Some((2, 2)),
+        }
+    }
+
+    #[test]
+    fn the_lru_never_evicts_a_visible_or_selected_preview() {
+        let mut cache = Cache::new(4);
+        let path = |i: usize| PathBuf::from(format!("/w/{i}.png"));
+        let none = HashSet::new();
+        for i in 0..4 {
+            cache.insert(path(i), "s".into(), preview(i as u8), &none);
+            cache.touch([&path(i)]);
+        }
+        // 0 was painted longest ago, but it is visible again now; 1 is the
+        // selected theme. 2 is the least recently painted unprotected one.
+        let protected: HashSet<_> = [path(0), path(1)].into_iter().collect();
+        cache.insert(path(4), "s".into(), preview(4), &protected);
+        assert_eq!(cache.len(), 4);
+        assert!(cache.get(&path(0)).is_some(), "visible preview evicted");
+        assert!(cache.get(&path(1)).is_some(), "selected preview evicted");
+        assert!(cache.get(&path(2)).is_none(), "the LRU victim stayed");
+        assert!(cache.get(&path(4)).is_some());
+        // With every entry protected the cache grows instead.
+        let all: HashSet<_> = (0..6).map(path).collect();
+        cache.insert(path(5), "s".into(), preview(5), &all);
+        assert_eq!(cache.len(), 5);
+        // A new stamp is wanted again; one on its way is not.
+        assert!(!cache.wants(&path(4), "s"));
+        assert!(cache.wants(&path(4), "t"));
+        cache.requested(path(9));
+        assert!(!cache.wants(&path(9), "s"));
+        cache.arrived(&path(9));
+        assert!(cache.wants(&path(9), "s"));
+    }
+
+    fn peak_rss_kb() -> u64 {
+        fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("VmHWM:"))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+            .unwrap()
+    }
+
+    fn decode_all(paths: &[PathBuf], gate: bool) -> u64 {
+        // Reset the peak (Linux clear_refs 5), then decode with two workers
+        // as the window does.
+        fs::write("/proc/self/clear_refs", "5").unwrap();
+        let base = peak_rss_kb();
+        let queue = Arc::new(Mutex::new(paths.to_vec()));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let queue = queue.clone();
+                std::thread::spawn(move || loop {
+                    let Some(path) = queue.lock().unwrap().pop() else {
+                        return;
+                    };
+                    assert!(decode_preview_gated(&path, gate).image.is_some());
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        peak_rss_kb().saturating_sub(base)
+    }
+
+    /// T7: peak RSS while decoding four 8K pictures (two PNG, two JPEG) on a
+    /// cold cache. Run with `cargo test --release -- --ignored peak_rss
+    /// --nocapture`.
+    #[test]
+    #[ignore = "writes four 8K pictures; run by hand to measure"]
+    fn peak_rss_decoding_8k_pictures() {
+        let _guard = lock();
+        let dir = sandbox("rss");
+        let mut paths = Vec::new();
+        for (i, format) in ["png", "jpg", "png", "jpg"].into_iter().enumerate() {
+            let img = image::RgbImage::from_fn(7680, 4320, |x, y| {
+                image::Rgb([(x / 30) as u8, (y / 17) as u8, (i * 60) as u8])
+            });
+            let path = dir.0.join(format!("w{i}.{format}"));
+            img.save(&path).unwrap();
+            paths.push(path);
+        }
+        std::env::set_var("XDG_CACHE_HOME", dir.0.join("cache-ungated"));
+        let ungated = decode_all(&paths, false);
+        std::env::set_var("XDG_CACHE_HOME", dir.0.join("cache-gated"));
+        let gated = decode_all(&paths, true);
+        println!("peak RSS above baseline: two parallel 8K decodes {ungated} kB, gated {gated} kB");
+        assert!(gated < 300 * 1024, "gated peak {gated} kB");
     }
 }
