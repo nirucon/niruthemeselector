@@ -195,14 +195,7 @@ impl App {
             &[atom("_NET_WM_WINDOW_TYPE_DIALOG")?],
         )
         .map_err(x)?;
-        let mut hints = vec![0u32; 18];
-        hints[0] = 1 << 4 | 1 << 5 | 1 << 10 | 1 << 11;
-        hints[5] = u32::from(layout::COMPACT_W);
-        hints[6] = u32::from(layout::COMPACT_H);
-        hints[7] = 1;
-        hints[8] = 1;
-        hints[9] = PAD as u32;
-        hints[10] = PAD as u32;
+        let hints = normal_hints(WIDTH, HEIGHT, layout::COMPACT_W, layout::COMPACT_H);
         c.change_property32(
             PropMode::REPLACE,
             win,
@@ -2470,4 +2463,34 @@ fn wait_for_input(app: &App, timeout: Option<Duration>) {
     };
     // SAFETY: a live array of pollfd structures and its length.
     let _ = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
+}
+
+/// WM_NORMAL_HINTS (ICCCM 4.1.2.3): the preferred size (PSize) and the
+/// smallest size the layout supports (PMinSize). No maximum: a window manager
+/// clamps to it, and a bogus one shrank 0.2.0 to a 1x1 stub.
+fn normal_hints(w: u16, h: u16, min_w: u16, min_h: u16) -> [u32; 18] {
+    const P_SIZE: u32 = 1 << 3;
+    const P_MIN_SIZE: u32 = 1 << 4;
+    let mut hints = [0u32; 18];
+    hints[0] = P_SIZE | P_MIN_SIZE;
+    hints[3] = u32::from(w);
+    hints[4] = u32::from(h);
+    hints[5] = u32::from(min_w);
+    hints[6] = u32::from(min_h);
+    hints
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::*;
+
+    #[test]
+    fn normal_hints_have_no_maximum() {
+        let h = normal_hints(WIDTH, HEIGHT, layout::COMPACT_W, layout::COMPACT_H);
+        assert_eq!(h[0] & (1 << 5), 0, "PMaxSize must not be set");
+        assert_eq!(h[0], 1 << 3 | 1 << 4);
+        assert_eq!((h[3], h[4]), (u32::from(WIDTH), u32::from(HEIGHT)));
+        assert_eq!((h[5], h[6]), (520, 420));
+        assert!(h[7..].iter().all(|v| *v == 0));
+    }
 }
