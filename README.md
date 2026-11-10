@@ -21,8 +21,8 @@ packs; they appear here as user themes.
 ## Features
 
 - Responsive grid of theme cards with wallpaper thumbnails and palette
-  swatches, with "Themes 1–9 of 23" in the header and a scrollbar you can click
-  or drag.
+  swatches, with the visible range and total (themes 1 to 9 of 23, for
+  example) in the header and a scrollbar you can click or drag.
 - A larger preview with a bar, focused window and launcher sample, the
   palette's hex values, the wallpaper's file name and resolution, the full error
   text of an invalid theme, and the other themes of the same family.
