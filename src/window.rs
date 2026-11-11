@@ -1352,10 +1352,30 @@ impl App {
         self.label(
             PAD,
             l.hints_y,
-            &self.fit(hints, 11.0, l.w as i16 - PAD * 2),
+            &self.fit(hints, 11.0, l.hints_w as i16),
             self.palette.muted,
             11.0,
-        )
+        )?;
+        self.paint_style(state, l)
+    }
+
+    /// "Alt+S  Wallpaper: Art" at the right of the hints: quiet like them,
+    /// lifted on hover, and a click switches Art and Signature.
+    fn paint_style(&self, state: &State, l: &Layout) -> Result<(), String> {
+        let r = l.style;
+        let text = style_label(state.catalog.style());
+        let hot = state.hover == Some(Hit::Style) && state.busy.is_none();
+        let (fg, bg) = if hot {
+            (self.palette.foreground, self.palette.surface)
+        } else {
+            (self.palette.muted, self.palette.background)
+        };
+        if hot {
+            self.fill(bg, r)?;
+        }
+        let shown = self.fit(&text, 11.0, r.width as i16 - 8);
+        let x0 = r.x + r.width as i16 - 4 - self.width(&shown, 11.0);
+        self.label_on(x0, l.hints_y, &shown, fg, bg, 11.0)
     }
 
     fn focus_rect(&self, state: &State, l: &Layout, focus: Hit) -> Option<Rectangle> {
@@ -1371,6 +1391,7 @@ impl App {
             }
             Hit::Button(button) => Some(l.button(button)),
             Hit::Chip(chip) => Some(l.chip(chip)),
+            Hit::Style => Some(l.style),
             _ => None,
         }
     }
@@ -1893,6 +1914,9 @@ impl App {
                 return Some(Hit::Undo);
             }
         }
+        if contains(l.style, px, py) {
+            return Some(Hit::Style);
+        }
         if contains(l.track, px, py) && state.scroll_thumb(l).is_some() {
             return Some(Hit::Scrollbar);
         }
@@ -2149,10 +2173,15 @@ fn confirm_rects(m: Rectangle) -> (Rectangle, Rectangle) {
     )
 }
 
+/// The footer's wallpaper style switch.
+pub fn style_label(style: backend::WallpaperStyle) -> String {
+    format!("Alt+S  Wallpaper: {}", style.label())
+}
+
 pub fn help_lines() -> Vec<&'static str> {
     vec![
         "Type                filter the grid by name or id; Esc clears, Esc again closes",
-        "Tab / Shift+Tab     move between cards, actions and filter chips",
+        "Tab / Shift+Tab     move between cards, actions, filter chips and the wallpaper style",
         "Arrows              choose a theme card (only the preview changes)",
         "PageUp/PageDown     move a page; Home/End to the first or last theme",
         "Enter               apply the selected theme, or press the focused control",
@@ -2164,6 +2193,7 @@ pub fn help_lines() -> Vec<&'static str> {
         "Alt+D               remove a user theme",
         "Alt+V               show the hidden themes (the Hidden chip)",
         "Alt+R               reload the catalogue",
+        "Alt+S               wallpaper style: each theme's Art, or the NIRUX Signature photo",
         "Ctrl+Q / Alt+Q      close the window",
         "Import fields       Ctrl+V or Shift+Insert paste, Ctrl+B browse, Ctrl+R replace",
         "The preview is representative; Apply uses the existing NIRUWM theme path.",
@@ -2492,5 +2522,18 @@ mod hint_tests {
         assert_eq!((h[3], h[4]), (u32::from(WIDTH), u32::from(HEIGHT)));
         assert_eq!((h[5], h[6]), (520, 420));
         assert!(h[7..].iter().all(|v| *v == 0));
+    }
+
+    #[test]
+    fn the_wallpaper_style_switch_names_its_key_and_state() {
+        use backend::WallpaperStyle;
+        assert_eq!(style_label(WallpaperStyle::Art), "Alt+S  Wallpaper: Art");
+        assert_eq!(
+            style_label(WallpaperStyle::Signature),
+            "Alt+S  Wallpaper: Signature"
+        );
+        assert!(help_lines().iter().any(|l| l.starts_with("Alt+S ")));
+        // The help still fits the smallest dialog.
+        assert!(52 + help_lines().len() as i32 * 19 <= 396);
     }
 }

@@ -33,6 +33,9 @@ const SCROLL_ROOM: i16 = 14;
 const CHIP_W: [i16; 4] = [44, 76, 56, 104];
 const CHIP_GAP: i16 = 6;
 const CHIPS_TOTAL: i16 = 44 + 76 + 56 + 104 + 3 * CHIP_GAP;
+/// "Alt+S  Wallpaper: Signature" at the right end of the key hints (27
+/// characters of the 11 px monospace hint font).
+const STYLE_W: i16 = 184;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -93,6 +96,10 @@ pub struct Layout {
     pub buttons: [Rectangle; 5],
     pub message: Rectangle,
     pub hints_y: i16,
+    /// Width of the key hints, which leave room for `style`.
+    pub hints_w: u16,
+    /// The wallpaper style switch ("Wallpaper: Art"), right of the hints.
+    pub style: Rectangle,
     pub card_w: u16,
     pub cols: usize,
     pub rows: usize,
@@ -217,6 +224,8 @@ pub fn layout(w: u16, h: u16) -> Layout {
         buttons,
         message: rect(PAD, footer_y, inner, 18),
         hints_y: footer_y + hints_dy,
+        hints_w: (inner - STYLE_W - 12).max(0) as u16,
+        style: rect(width - PAD - STYLE_W, footer_y + hints_dy - 2, STYLE_W, 17),
         card_w,
         cols,
         rows,
@@ -312,10 +321,8 @@ mod tests {
             ("grid".into(), l.grid),
             ("panel".into(), l.panel),
             ("message".into(), l.message),
-            (
-                "hints".into(),
-                rect(PAD, l.hints_y, l.w as i16 - PAD * 2, 14),
-            ),
+            ("hints".into(), rect(PAD, l.hints_y, l.hints_w as i16, 14)),
+            ("style".into(), l.style),
         ];
         if let Some(y) = l.reason_y {
             out.push(("reason".into(), rect(PAD, y, l.w as i16 - PAD * 2, 16)));

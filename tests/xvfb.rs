@@ -4,7 +4,7 @@
 //! `setxkbmap`; CI runs it with `cargo test --locked --test xvfb --
 //! --ignored`. The fixture serves a catalogue of 30 themes, records every
 //! argument vector it is started with, and takes 5 seconds for `theme` when
-//! told to.
+//! told to. `wallpaper style toggle` flips the catalogue's `theme_style`.
 
 use std::{
     fs,
@@ -20,6 +20,7 @@ const FIXTURE: &str = r#"#!/bin/sh
 FX=${NTS_FX:?}
 printf '%s\n' "$*" >> "$FX/argv.log"
 active=$(cat "$FX/active" 2>/dev/null || echo t01)
+style=$(cat "$FX/style" 2>/dev/null || echo art)
 case "$1" in
 theme-catalog)
   printf '{"schema":1,"active":"%s","themes":[' "$active"
@@ -29,7 +30,12 @@ theme-catalog)
     printf '%s{"id":"%s","name":"Theme %02d","builtin":true,"overridden":false,"hidden":false,"valid":true,"error":null,"colors":{"name":"Theme %02d","background":"%02x2030","foreground":"eeeeee","muted":"999999","border":"333333","focus":"88c0d0"},"wallpaper":"%s/walls/%s.png","wallpaper_available":true}' "$sep" "$id" $i $i $((i*8)) "$FX" "$id"
     sep=,; i=$((i+1))
   done
-  printf '],"hidden":[],"appearance_overrides":false,"follow_theme":true,"theme_dir":"%s/walls"}\n' "$FX" ;;
+  printf '],"hidden":[],"appearance_overrides":false,"follow_theme":true,"theme_dir":"%s/walls","theme_style":"%s"}\n' "$FX" "$style" ;;
+wallpaper)
+  [ "$2 $3" = "style toggle" ] || { echo "fixture: $*" >&2; exit 2; }
+  if [ "$style" = art ]; then style=signature; else style=art; fi
+  printf '%s' "$style" > "$FX/style"
+  echo "theme_style=$style" ;;
 theme)
   if [ -f "$FX/slow" ]; then sleep "$(cat "$FX/slow")"; fi
   printf '%s' "$2" > "$FX/active"
@@ -251,6 +257,22 @@ fn wheel_typing_double_click_undo_and_a_slow_apply_under_xvfb() {
     s.wait_log(Duration::from_secs(5), "the undo", |l| {
         count(l, "done t01") == 1
     });
+
+    // Alt+S switches the wallpaper style through niructl, then reads the
+    // catalogue again.
+    let before = s.log().len();
+    s.xdotool(&["key", "alt+s"]);
+    s.wait_log(Duration::from_secs(5), "the style toggle", |l| {
+        let new = &l[before..];
+        new.iter()
+            .position(|x| x == "wallpaper style toggle")
+            .is_some_and(|at| new[at..].iter().any(|x| x == "theme-catalog"))
+    });
+    assert_eq!(
+        fs::read_to_string(s.root.join("style")).unwrap(),
+        "signature"
+    );
+    sleep(Duration::from_millis(500));
 
     // T2: a Swedish keymap types the documented path into the import
     // dialog. xdotool presses the level's modifiers itself: `dead_tilde`

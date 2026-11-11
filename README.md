@@ -34,6 +34,10 @@ packs; they appear here as user themes.
   **Browse…** list and a check of both paths and the theme's name and palette
   before anything is imported. Remove user themes; hide or show bundled
   themes. Disabled buttons say why.
+- Switch the wallpaper style for every theme with `Alt+S` or a click on
+  **Wallpaper: Art** at the right of the key hints: **Art** shows each theme's
+  own artwork, **Signature** the NIRUX photo tinted in the theme's colours
+  (a theme without a Signature picture keeps its artwork).
 - A compact one-column layout when the window is tiled smaller than 900×620,
   down to 520×420.
 - Honest wallpaper fallback: a theme without its image uses its background
@@ -79,7 +83,7 @@ niruthemeselector --help
 |---|---|
 | Typing | Filter the grid by name or id |
 | `Esc` | Clear the filter; with no filter, close the window |
-| `Tab` / `Shift+Tab` | Move between cards, actions and filter chips |
+| `Tab` / `Shift+Tab` | Move between cards, actions, filter chips and the wallpaper style |
 | Arrows, `PageUp` / `PageDown`, `Home` / `End` | Choose a theme (only the preview changes) |
 | `Enter` | Apply the selected theme, or press the focused control |
 | `Space` | Press the focused control (adds a space once a filter is typed) |
@@ -88,6 +92,7 @@ niruthemeselector --help
 | `Alt+A` / `Alt+I` / `Alt+H` / `Alt+D` | Apply / import / hide-show / remove |
 | `Alt+V` | Show the hidden themes (the Hidden chip) |
 | `Alt+R` | Reload the catalogue |
+| `Alt+S` | Switch the wallpaper style between Art and Signature |
 | `Ctrl+Q` / `Alt+Q` | Close |
 | `F1` | Help |
 
@@ -116,6 +121,16 @@ User themes can be removed; bundled themes can only be hidden. Removing or
 hiding the active theme is refused until another theme is applied. Imported
 theme files are data and are never executed.
 
+### Wallpaper style
+
+The footer shows the current style, **Wallpaper: Art** or **Wallpaper:
+Signature**. `Alt+S` (or a click on it, or `Enter` when it has the focus) runs
+`niructl wallpaper style toggle`, which saves `[wallpaper] theme_style` in
+NIRUWM's configuration and reloads the running WM, then reads the catalogue
+again so the cards show the new pictures. It is the same setting as
+`niructl wallpaper style art|signature`. A niructl from before the setting
+shows Art and answers the switch with a short "update NIRUX" message.
+
 ## Configuration
 
 There is no configuration file of its own: themes, user themes and the hidden
@@ -125,8 +140,9 @@ a new user theme, a theme wallpaper) are noticed through inotify, debounced by
 300 ms into one catalogue read; focusing the window also reads it again, and
 `Alt+R` reloads by hand.
 
-Apply, import, hide and remove run `niructl` on one worker thread, one action at
-a time, each with a deadline (30 s for apply and import, 5 s otherwise). The
+Apply, import, hide, remove and the wallpaper style switch run `niructl` on one
+worker thread, one action at a time, each with a deadline (30 s for apply,
+import and the style switch, which wait for the WM to reload; 5 s otherwise). The
 window keeps painting and shows "Applying Niru Nord…" with the actions disabled;
 a late answer never overwrites a newer state.
 

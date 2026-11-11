@@ -6,7 +6,7 @@
 //! scroll, filter, undo and import rules testable as plain functions.
 
 use crate::{
-    backend::{Action, Catalog, ThemeEntry},
+    backend::{Action, Catalog, ThemeEntry, WallpaperStyle},
     import::{self, PathStatus, Preview, Want},
     layout::{Button, Chip, Layout},
     theme::{self, Palette},
@@ -341,6 +341,8 @@ pub enum Hit {
     Chip(Chip),
     Scrollbar,
     Undo,
+    /// "Wallpaper: Art" in the footer: switches Art and Signature.
+    Style,
     Family(usize),
     Field(usize),
     BrowseFor(usize),
@@ -421,8 +423,12 @@ pub struct State {
 
 pub fn snapshot(catalog: &Catalog, cards: &[Card]) -> String {
     let mut out = format!(
-        "{}|{}|{}|{}|",
-        catalog.active, catalog.appearance_overrides, catalog.follow_theme, catalog.theme_dir
+        "{}|{}|{}|{}|{}|",
+        catalog.active,
+        catalog.appearance_overrides,
+        catalog.follow_theme,
+        catalog.theme_dir,
+        catalog.style().id()
     );
     for (theme, card) in catalog.themes.iter().zip(cards) {
         out.push_str(&serde_json::to_string(theme).unwrap_or_default());
@@ -884,6 +890,15 @@ impl State {
         }
     }
 
+    /// Switch every theme's picture between Art and Signature.
+    pub fn toggle_style(&mut self, now: Instant) -> Command {
+        if self.busy.is_some() {
+            self.set_message("Wait for the current action to finish.", true);
+            return Command::Redraw;
+        }
+        self.start(Action::WallpaperStyle, now)
+    }
+
     /// Re-apply the theme that was active before the last Apply.
     pub fn undo(&mut self, now: Instant) -> Command {
         let Some(undo) = self.undo.clone().filter(|u| u.until > now) else {
@@ -962,6 +977,15 @@ impl State {
                 }
             }
             Action::Remove { name, .. } => self.set_message(format!("Removed {name}."), false),
+            Action::WallpaperStyle => self.set_message(
+                match self.catalog.style() {
+                    WallpaperStyle::Art => "Wallpaper: Art. Each theme shows its own artwork.",
+                    WallpaperStyle::Signature => {
+                        "Wallpaper: Signature. A theme without a Signature picture keeps its artwork."
+                    }
+                },
+                false,
+            ),
             Action::Hide { name, hide, .. } => self.set_message(
                 if *hide {
                     format!("Hid {name}. It stays installed; the Hidden chip shows it.")
@@ -1001,6 +1025,7 @@ impl State {
         let mut order: Vec<Hit> = self.visible().into_iter().map(Hit::Card).collect();
         order.extend(crate::layout::BUTTONS.map(Hit::Button));
         order.extend(crate::layout::CHIPS.map(Hit::Chip));
+        order.push(Hit::Style);
         order
     }
 
@@ -1058,6 +1083,10 @@ impl State {
                 Command::Redraw
             }
             Hit::Undo => self.undo(now),
+            Hit::Style => {
+                self.focus = Some(Hit::Style);
+                self.toggle_style(now)
+            }
             Hit::Confirm => self.confirm_remove(now),
             Hit::Cancel => {
                 self.modal = match self.modal.take() {
@@ -1202,6 +1231,7 @@ impl State {
                 b if b == letter(b'h') => self.press(Button::Hide, now),
                 b if b == letter(b'd') => self.press(Button::Remove, now),
                 b if b == letter(b'r') => self.press(Button::Reload, now),
+                b if b == letter(b's') => self.toggle_style(now),
                 b if b == letter(b'v') => {
                     let chip = if self.chip == Chip::Hidden {
                         Chip::All
@@ -1271,7 +1301,9 @@ impl State {
                 Command::Redraw
             }
             K_RETURN | K_KP_ENTER => match self.focus {
-                Some(hit @ (Hit::Button(_) | Hit::Chip(_))) => self.activate(hit, l, now),
+                Some(hit @ (Hit::Button(_) | Hit::Chip(_) | Hit::Style)) => {
+                    self.activate(hit, l, now)
+                }
                 // Enter on a card (or with nothing focused) applies the
                 // selected theme, as the footer says.
                 _ => self.press(Button::Apply, now),
@@ -1656,6 +1688,76 @@ pub mod tests {
         late.undo = Some(Undo { until: now, ..undo });
         assert_eq!(late.undo(now + Duration::from_secs(16)), Command::None);
         assert!(late.expire(now + Duration::from_secs(16)));
+    }
+
+    #[test]
+    fn alt_s_switches_the_wallpaper_style_and_reloads_the_catalogue() {
+        let mut s = state(10);
+        let l = layout(1120, 760);
+        let now = Instant::now();
+        assert_eq!(s.catalog.style(), WallpaperStyle::Art);
+        let alt_s = Key {
+            sym: u32::from(b's'),
+            base: u32::from(b's'),
+            alt: true,
+            ..Key::default()
+        };
+        // A plain s still types into the filter.
+        assert_eq!(s.handle_key(key(u32::from(b's')), &l, now), Command::Redraw);
+        assert_eq!(s.filter, "s");
+        s.handle_key(key(K_ESCAPE), &l, now);
+        assert_eq!(
+            s.handle_key(alt_s, &l, now),
+            Command::Start(Action::WallpaperStyle)
+        );
+        assert_eq!(s.message, "Switching the wallpaper style\u{2026}");
+        // A second press while it runs starts nothing.
+        assert_eq!(s.handle_key(alt_s, &l, now), Command::Redraw);
+        let serial = s.busy.as_ref().unwrap().serial;
+        let mut after = catalog(10);
+        after.theme_style = Some("signature".into());
+        let seen = s.seen.clone();
+        assert!(s.finish(
+            serial,
+            Ok(()),
+            Some(Ok(after)),
+            Palette::fallback(),
+            &l,
+            now
+        ));
+        assert_ne!(s.seen, seen, "a style change counts as a change");
+        assert_eq!(s.catalog.style(), WallpaperStyle::Signature);
+        assert!(
+            s.message.starts_with("Wallpaper: Signature."),
+            "{}",
+            s.message
+        );
+        assert!(!s.message_is_error);
+        // The footer label is a control: a click and Enter on it toggle too.
+        assert_eq!(
+            s.activate(Hit::Style, &l, now),
+            Command::Start(Action::WallpaperStyle)
+        );
+        let serial = s.busy.as_ref().unwrap().serial;
+        // An older niructl: the error shows, the style is unchanged.
+        let same = s.catalog.clone();
+        s.finish(
+            serial,
+            Err("This niructl cannot switch the wallpaper style yet; update NIRUX.".into()),
+            Some(Ok(same)),
+            Palette::fallback(),
+            &l,
+            now,
+        );
+        assert!(s.busy.is_none() && s.message_is_error);
+        assert!(s.message.contains("update NIRUX"));
+        assert_eq!(s.catalog.style(), WallpaperStyle::Signature);
+        s.focus = Some(Hit::Style);
+        assert_eq!(
+            s.handle_key(key(K_RETURN), &l, now),
+            Command::Start(Action::WallpaperStyle)
+        );
+        assert!(s.focus_order().contains(&Hit::Style));
     }
 
     #[test]

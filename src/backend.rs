@@ -71,6 +71,51 @@ pub struct Catalog {
     pub follow_theme: bool,
     #[serde(default)]
     pub theme_dir: String,
+    /// `art` or `signature` (newer NIRUWM). Missing, null or
+    /// unknown reads as `art`, which is what an older niructl shows.
+    #[serde(default)]
+    pub theme_style: Option<String>,
+}
+
+impl Catalog {
+    pub fn style(&self) -> WallpaperStyle {
+        WallpaperStyle::parse(self.theme_style.as_deref().unwrap_or(""))
+    }
+}
+
+/// Which picture each theme shows: its own artwork, or the NIRUX Signature
+/// photo tinted in the theme's colours (falling back to the artwork).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WallpaperStyle {
+    #[default]
+    Art,
+    Signature,
+}
+
+impl WallpaperStyle {
+    pub fn parse(value: &str) -> Self {
+        if value.trim().eq_ignore_ascii_case("signature") {
+            WallpaperStyle::Signature
+        } else {
+            WallpaperStyle::Art
+        }
+    }
+
+    /// The value niructl uses.
+    pub fn id(self) -> &'static str {
+        match self {
+            WallpaperStyle::Art => "art",
+            WallpaperStyle::Signature => "signature",
+        }
+    }
+
+    /// The word the window shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            WallpaperStyle::Art => "Art",
+            WallpaperStyle::Signature => "Signature",
+        }
+    }
 }
 
 pub fn find_niructl() -> Option<PathBuf> {
@@ -241,6 +286,24 @@ pub fn apply(id: &str) -> Result<(), String> {
     run_within(&["theme", id], SLOW_DEADLINE).map(|_| ())
 }
 
+/// `niructl wallpaper style toggle`: it writes the setting and waits for
+/// the running WM to reload, like `niructl theme`.
+pub fn toggle_wallpaper_style() -> Result<(), String> {
+    run_within(&["wallpaper", "style", "toggle"], SLOW_DEADLINE)
+        .map(|_| ())
+        .map_err(|error| style_error(&error))
+}
+
+/// A short reason for a failed style switch. A niructl older than the
+/// setting answers with its whole usage text.
+fn style_error(error: &str) -> String {
+    if error.contains("Usage:") {
+        "This niructl cannot switch the wallpaper style yet; update NIRUX.".into()
+    } else {
+        format!("Cannot switch the wallpaper style: {error}")
+    }
+}
+
 pub fn expand_home(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         let home = std::env::var_os("HOME")
@@ -306,6 +369,8 @@ pub enum Action {
         name: String,
         hide: bool,
     },
+    /// Switch every theme's picture between Art and Signature.
+    WallpaperStyle,
 }
 
 impl Action {
@@ -322,6 +387,7 @@ impl Action {
                     if *hide { "Hiding" } else { "Showing" }
                 )
             }
+            Action::WallpaperStyle => "Switching the wallpaper style\u{2026}".into(),
         }
     }
 
@@ -338,6 +404,7 @@ impl Action {
             } => import(theme, wallpaper, id, *replace),
             Action::Remove { id, .. } => remove(id),
             Action::Hide { id, hide, .. } => self::hide(id, *hide),
+            Action::WallpaperStyle => toggle_wallpaper_style(),
         };
         (result, Some(catalog()))
     }
@@ -346,8 +413,12 @@ impl Action {
 pub fn status_text() -> Result<String, String> {
     let catalog = catalog()?;
     let mut text = format!(
-        "active={}\nappearance_overrides={}\nfollow_theme={}\ntheme_dir={}\n",
-        catalog.active, catalog.appearance_overrides, catalog.follow_theme, catalog.theme_dir
+        "active={}\nappearance_overrides={}\nfollow_theme={}\ntheme_dir={}\ntheme_style={}\n",
+        catalog.active,
+        catalog.appearance_overrides,
+        catalog.follow_theme,
+        catalog.theme_dir,
+        catalog.style().id()
     );
     for entry in catalog.themes {
         let origin = if entry.overridden {
@@ -391,6 +462,45 @@ mod tests {
         assert_eq!(catalog.themes[0].colors.as_ref().unwrap().focus, "88c0d0");
         assert!(!catalog.themes[1].valid);
         assert_eq!(catalog.themes[1].error.as_deref(), Some("bad colour"));
+        // An older niructl has no theme_style: that is Art.
+        assert_eq!(catalog.theme_style, None);
+        assert_eq!(catalog.style(), WallpaperStyle::Art);
+    }
+
+    #[test]
+    fn reads_the_wallpaper_style() {
+        let with = |value: &str| {
+            let json = SAMPLE.replacen(
+                "\"schema\": 1,",
+                &format!("\"schema\": 1, \"theme_style\": {value},"),
+                1,
+            );
+            serde_json::from_str::<Catalog>(&json).unwrap()
+        };
+        let catalog = with("\"signature\"");
+        assert_eq!(catalog.style(), WallpaperStyle::Signature);
+        assert_eq!(catalog.themes.len(), 2, "the rest still parses");
+        assert_eq!(with("\"art\"").style(), WallpaperStyle::Art);
+        assert_eq!(with("null").style(), WallpaperStyle::Art);
+        assert_eq!(with("\"future\"").style(), WallpaperStyle::Art);
+        assert_eq!(WallpaperStyle::Signature.label(), "Signature");
+        assert_eq!(WallpaperStyle::Art.id(), "art");
+        assert_eq!(Catalog::default().style(), WallpaperStyle::Art);
+    }
+
+    #[test]
+    fn an_old_niructl_gets_a_short_style_error() {
+        let old = style_error("niructl: Usage: niructl status | tag N | movetotag N | reset");
+        assert!(old.contains("update NIRUX"), "{old}");
+        assert!(old.len() < 120);
+        assert_eq!(
+            style_error("no answer"),
+            "Cannot switch the wallpaper style: no answer"
+        );
+        assert_eq!(
+            Action::WallpaperStyle.busy_text(),
+            "Switching the wallpaper style\u{2026}"
+        );
     }
 
     #[test]

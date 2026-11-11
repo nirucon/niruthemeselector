@@ -361,7 +361,10 @@ fn write_cache(path: &Path, image: &image::RgbaImage) {
         .flatten()
         .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("png"))
         .collect();
-    cached.sort_by_key(|entry| entry.metadata().and_then(|m| m.modified()).ok());
+    // Each modification time is read once: the other decode worker may
+    // write or prune this directory meanwhile, and a key that changes
+    // during the sort makes it panic.
+    cached.sort_by_cached_key(|entry| entry.metadata().and_then(|m| m.modified()).ok());
     let excess = cached.len().saturating_sub(127);
     for entry in cached.into_iter().take(excess) {
         let _ = fs::remove_file(entry.path());
